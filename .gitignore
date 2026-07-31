@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 *.log
 .DS_Store
+assets/*-source.png
 
 # Local/older deployment attempts not used by Cutivanta Lens
 app_3.py

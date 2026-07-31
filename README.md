@@ -8,6 +8,9 @@ This Streamlit app provides the complete project analysis:
 4. Grad-CAM and non-diagnostic visual descriptors
 5. Illustrated PDF report with the original and lesion-overlay images
 
+The project logo is stored at `assets/cutivanta-logo.png` and is used in the
+app header and browser tab.
+
 ## Run locally
 
 From the `Deploy` directory:

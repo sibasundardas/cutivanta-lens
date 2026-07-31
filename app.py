@@ -7,6 +7,7 @@ descriptors. It is a research demo, not a medical device.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 from io import BytesIO
 from pathlib import Path
@@ -29,6 +30,7 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 APP_DIR = Path(__file__).resolve().parent
 SEGMENTATION_MODEL = APP_DIR / "unet_efficientnetv2s_final.keras"
 CLASSIFICATION_MODEL = APP_DIR / "densenet201_best.h5"
+LOGO_PATH = APP_DIR / "assets" / "cutivanta-logo.png"
 
 SEG_SIZE = (256, 256)
 CLS_SIZE = (224, 224)
@@ -98,7 +100,7 @@ DISEASE_GUIDE = {
 
 st.set_page_config(
     page_title="Cutivanta Lens",
-    page_icon="CL",
+    page_icon=str(LOGO_PATH),
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -126,8 +128,8 @@ def inject_styles() -> None:
         .hero:before,.hero:after { content:''; position:absolute; border-radius:50%; border:1px solid rgba(255,255,255,.15); }
         .hero:before { width:310px; height:310px; right:-75px; top:-135px; }
         .hero:after { width:205px; height:205px; right:35px; top:-82px; }
-        .brand { display:inline-flex; gap:10px; align-items:center; font-size:.8rem; letter-spacing:.16em; text-transform:uppercase; font-weight:750; opacity:.86; }
-        .brand-dot { width:10px; height:10px; border-radius:50%; background:#65eed5; box-shadow:0 0 18px #65eed5; }
+        .brand { display:inline-flex; gap:12px; align-items:center; font-size:.8rem; letter-spacing:.16em; text-transform:uppercase; font-weight:750; opacity:.95; }
+        .brand-logo { width:48px; height:48px; object-fit:contain; padding:5px; border-radius:14px; background:rgba(255,255,255,.12); border:1px solid rgba(255,255,255,.18); }
         .hero h1 { color:white !important; font-size:clamp(2.35rem,5vw,4.45rem); margin:.55rem 0 .45rem; max-width:840px; line-height:1.02; }
         .hero p { max-width:670px; opacity:.86; font-size:1.04rem; line-height:1.65; margin:0; }
         .upload-title { text-align:center; font-size:1.28rem; font-weight:750; margin:4px 0 3px; }
@@ -508,10 +510,11 @@ def build_pdf_report(
 
 def main() -> None:
     inject_styles()
+    logo_data = base64.b64encode(LOGO_PATH.read_bytes()).decode("ascii")
     st.markdown(
-        """
+        f"""
         <section class="hero">
-          <div class="brand"><span class="brand-dot"></span>Cutivanta Lens</div>
+          <div class="brand"><img class="brand-logo" src="data:image/png;base64,{logo_data}" alt="Cutivanta Lens logo">Cutivanta Lens</div>
           <h1>Look closer. Understand better.</h1>
           <p>A focused visual workspace for lesion localization, model evidence, image measurements, and carefully sourced condition information.</p>
         </section>
