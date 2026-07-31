@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.log
+.DS_Store
+
+# Local/older deployment attempts not used by Cutivanta Lens
+app_3.py
+app_DenseNet_issue.py
+app_Improved_One_2.py
+
+# Duplicate segmentation export; app.py uses the .keras model instead
+unet_efficientnetv2s_final.h5
