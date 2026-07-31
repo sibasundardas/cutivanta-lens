@@ -20,6 +20,9 @@ python -m pip install -r requirements.txt
 streamlit run app.py
 ```
 
+For Streamlit Community Cloud, deploy with **Python 3.12**. TensorFlow 2.18 is
+not available for Python 3.14.
+
 If a browser tab was already open while Streamlit restarted and shows a
 `Failed to fetch dynamically imported module` message, close that tab and
 open `http://localhost:8501` again (or use a hard refresh with `Ctrl+F5`).

@@ -51,8 +51,24 @@ unused 381 MB duplicate and is intentionally ignored.
 2. Connect the GitHub account containing the repository.
 3. Select **Create app** and choose the `cutivanta-lens` repository.
 4. Select branch `main` and entrypoint `app.py`.
-5. In Advanced settings, select Python 3.12.
+5. In **Advanced settings**, select **Python 3.12**. TensorFlow 2.18 does not
+   provide Python 3.14 wheels, so do not select Python 3.14.
 6. Deploy and monitor the build logs while dependencies and LFS models load.
+
+### If the app was accidentally created with Python 3.14
+
+Streamlit does not support changing the Python version of an existing deployed
+app. In Streamlit Community Cloud:
+
+1. Open the app and select **Manage app**.
+2. Save the current repository, branch, entrypoint, subdomain, and any secrets.
+3. Delete the deployed app (this does not delete the GitHub repository).
+4. Select **Create app** and choose the same repository and `app.py`.
+5. Open **Advanced settings**, choose **Python 3.12**, and deploy again.
+
+The requirements use `tensorflow-cpu==2.18.0`. It loads the same Keras models
+and exposes the same `tensorflow` Python import while avoiding the much larger
+GPU-enabled Linux wheel.
 
 ## Resource note
 
