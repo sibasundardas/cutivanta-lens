@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,16 @@ APP_DIR = Path(__file__).resolve().parent
 SEGMENTATION_MODEL = APP_DIR / "unet_efficientnetv2s_final.keras"
 CLASSIFICATION_MODEL = APP_DIR / "densenet201_best.h5"
 LOGO_PATH = APP_DIR / "assets" / "cutivanta-logo.png"
+
+BRAND_NAME = "CutiVanta Lens"
+MODEL_VERSION = "U-Net EfficientNetV2S + DenseNet201 / 1.0"
+APPLICATION_VERSION = "1.1.0"
+RESEARCH_CAUTION = (
+    "This prototype was developed using HAM10000-style dermoscopic images. Performance may be lower "
+    "for ordinary smartphone photographs, poor-quality images, uncommon conditions, multiple lesions, "
+    "images containing artefacts or populations insufficiently represented in the training data. "
+    "A high model score does not confirm a diagnosis."
+)
 
 SEG_SIZE = (256, 256)
 CLS_SIZE = (224, 224)
@@ -76,7 +87,7 @@ DISEASE_GUIDE = {
     },
     "MEL": {
         "about": "Melanoma is a potentially serious skin cancer because it can invade and spread. An image classification is not a diagnosis; biopsy and pathology are required to confirm melanoma and determine its characteristics.",
-        "care": "Prompt specialist assessment and biopsy are the next steps for a suspicious lesion. If melanoma is confirmed, surgery is the cornerstone for localized disease. The required excision and any lymph-node testing or additional immunotherapy, targeted therapy, radiation, or other treatment depend on pathological stage, vertical Breslow thickness, ulceration, lymph nodes, spread, and overall health—not the percentage of this photograph covered by the mask.",
+        "care": "A qualified dermatologist may perform clinical and dermoscopic assessment and, when indicated, recommend biopsy or other investigations. If melanoma is confirmed, management depends on pathology, stage, Breslow thickness, ulceration, lymph-node findings, spread, and overall health—not the percentage of this photograph covered by the mask.",
         "urgency": "Arrange prompt dermatologist assessment; do not wait for another AI image result if the lesion is changing, bleeding, or otherwise concerning.",
         "source": "American Academy of Dermatology - Melanoma diagnosis and treatment",
         "url": "https://www.aad.org/public/diseases/skin-cancer/types/common/melanoma/diagnose-treat",
@@ -99,7 +110,7 @@ DISEASE_GUIDE = {
 
 
 st.set_page_config(
-    page_title="Cutivanta Lens",
+    page_title=BRAND_NAME,
     page_icon=str(LOGO_PATH),
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -148,6 +159,10 @@ def inject_styles() -> None:
         .descriptor-line { height:7px; border-radius:99px; background:#e8efed; margin-top:8px; overflow:hidden; }
         .descriptor-fill { height:100%; background:#20ad98; border-radius:99px; }
         .section-rule { height:1px; background:linear-gradient(90deg,transparent,#b8d2cb,transparent); margin:34px 0; }
+        .copyright { text-align:center; color:var(--muted); font-size:.78rem; margin:28px 0 4px; }
+        div[data-baseweb="tab-list"] { gap:6px; background:#e7f0ed; padding:5px; border-radius:15px; }
+        button[data-baseweb="tab"] { flex:1; border-radius:11px; min-height:42px; font-weight:750; }
+        button[data-baseweb="tab"][aria-selected="true"] { background:white; color:var(--teal); box-shadow:0 3px 12px rgba(20,65,56,.12); }
         .stButton>button, .stDownloadButton>button { width:100%; border-radius:14px; min-height:48px; font-weight:750; border:0; background:linear-gradient(90deg,#087f72,#6559d8); color:#fff; box-shadow:0 10px 25px rgba(8,127,114,.18); }
         .stButton>button:hover, .stDownloadButton>button:hover { color:#fff; border:0; transform:translateY(-1px); }
         footer { visibility:hidden; }
@@ -171,12 +186,18 @@ def load_models() -> tuple[tf.keras.Model, tf.keras.Model]:
     return seg_model, cls_model
 
 
-def read_image(uploaded_file: Any) -> np.ndarray:
+def read_image(uploaded_file: Any) -> tuple[np.ndarray, dict[str, Any]]:
     image = Image.open(uploaded_file)
+    original_mode = image.mode
     image = ImageOps.exif_transpose(image).convert("RGB")
+    width, height = image.size
+    metadata = {
+        "original_mode": original_mode,
+        "aspect_ratio": width / max(height, 1),
+    }
     if max(image.size) > 2400:
         image.thumbnail((2400, 2400), Image.Resampling.LANCZOS)
-    return np.asarray(image)
+    return np.asarray(image), metadata
 
 
 def largest_component(binary_mask: np.ndarray) -> np.ndarray:
@@ -193,6 +214,9 @@ def segment_lesion(model: tf.keras.Model, image_rgb: np.ndarray) -> dict[str, An
     probability = np.squeeze(model.predict(tensor, verbose=0)).astype(np.float32)
     binary = (probability >= MASK_THRESHOLD).astype(np.uint8)
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    component_count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    minimum_candidate_area = binary.size * 0.005
+    candidate_count = int(sum(area >= minimum_candidate_area for area in stats[1:, cv2.CC_STAT_AREA]))
     binary = largest_component(binary)
 
     height, width = image_rgb.shape[:2]
@@ -211,6 +235,8 @@ def segment_lesion(model: tf.keras.Model, image_rgb: np.ndarray) -> dict[str, An
         "mask": mask,
         "coverage": coverage,
         "certainty": certainty,
+        "foreground_probability": foreground_certainty if np.any(mask) else 0.0,
+        "candidate_count": candidate_count,
     }
 
 
@@ -266,33 +292,112 @@ def heatmap_overlay(crop_rgb: np.ndarray, heatmap: np.ndarray) -> tuple[np.ndarr
     return overlay, heat
 
 
-def mask_overlay(image_rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+def mask_overlay(
+    image_rgb: np.ndarray,
+    mask: np.ndarray,
+    opacity: float = 0.48,
+    boundary_thickness: int | None = None,
+) -> np.ndarray:
     overlay = image_rgb.copy()
     tint = np.zeros_like(image_rgb)
     tint[..., 0], tint[..., 1], tint[..., 2] = 240, 103, 86
-    selected = cv2.addWeighted(image_rgb, 0.52, tint, 0.48, 0)
+    opacity = float(np.clip(opacity, 0.0, 1.0))
+    selected = cv2.addWeighted(image_rgb, 1.0 - opacity, tint, opacity, 0)
     overlay[mask == 1] = selected[mask == 1]
     contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cv2.drawContours(overlay, contours, -1, (244, 244, 225), max(2, image_rgb.shape[1] // 280))
+    inner = boundary_thickness or max(2, image_rgb.shape[1] // 280)
+    cv2.drawContours(overlay, contours, -1, (25, 28, 28), inner + max(2, inner))
+    cv2.drawContours(overlay, contours, -1, (255, 255, 255), inner)
     return overlay
 
 
-def quality_checks(image_rgb: np.ndarray, coverage: float) -> tuple[list[str], float]:
+def quality_checks(
+    image_rgb: np.ndarray,
+    segmentation: dict[str, Any],
+    image_metadata: dict[str, Any],
+) -> tuple[list[str], float]:
     gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
     focus = float(cv2.Laplacian(gray, cv2.CV_64F).var())
     brightness = float(gray.mean())
+    coverage = float(segmentation["coverage"])
+    mask = segmentation["mask"].astype(bool)
     warnings: list[str] = []
     if focus < 35:
-        warnings.append("Image may be out of focus")
-    if brightness < 35:
-        warnings.append("Image is very dark")
-    elif brightness > 225:
-        warnings.append("Image is overexposed")
-    if coverage < 0.005:
-        warnings.append("No stable lesion region was localized")
+        warnings.append("Blur or poor focus detected")
+    dark_fraction = float(np.mean(gray <= 15))
+    bright_fraction = float(np.mean(gray >= 245))
+    if brightness < 42 or dark_fraction > 0.35:
+        warnings.append("Underexposure detected")
+    if brightness > 218 or bright_fraction > 0.25:
+        warnings.append("Overexposure detected")
+    if coverage < 0.01:
+        warnings.append("Extremely small lesion or no stable lesion region localized")
     elif coverage > 0.90:
         warnings.append("Mask covers almost the entire image")
+    if np.any(mask):
+        ys, xs = np.where(mask)
+        center_x, center_y = float(xs.mean() / mask.shape[1]), float(ys.mean() / mask.shape[0])
+        if abs(center_x - 0.5) > 0.23 or abs(center_y - 0.5) > 0.23:
+            warnings.append("Lesion is not centred")
+        edge_y = max(1, int(mask.shape[0] * 0.015))
+        edge_x = max(1, int(mask.shape[1] * 0.015))
+        if mask[:edge_y].any() or mask[-edge_y:].any() or mask[:, :edge_x].any() or mask[:, -edge_x:].any():
+            warnings.append("Lesion touches an image border")
+    if int(segmentation.get("candidate_count", 0)) > 1:
+        warnings.append("Multiple candidate lesions detected")
+
+    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17)))
+    hair_fraction = float(np.mean(blackhat > 22))
+    if hair_fraction > 0.055:
+        warnings.append("Possible hair obstruction")
+
+    edges = cv2.Canny(gray, 60, 160)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=70, minLineLength=min(gray.shape) * 0.42, maxLineGap=12)
+    hsv = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2HSV)
+    blue_ink = ((hsv[..., 0] > 85) & (hsv[..., 0] < 140) & (hsv[..., 1] > 80) & (hsv[..., 2] < 210))
+    if (lines is not None and len(lines) >= 3) or float(blue_ink.mean()) > 0.008:
+        warnings.append("Possible ruler or ink-marker artefact")
+    aspect_ratio = float(image_metadata.get("aspect_ratio", 1.0))
+    if aspect_ratio > 3.0 or aspect_ratio < 1 / 3:
+        warnings.append("Invalid aspect ratio")
+    if image_metadata.get("original_mode") not in {"RGB", "RGBA"}:
+        warnings.append(f"Unsupported colour mode ({image_metadata.get('original_mode', 'unknown')}); converted to RGB")
+    saturation = float(hsv[..., 1].mean())
+    if saturation < 12 or (coverage < 0.01 and focus > 80):
+        warnings.append("Image may have a non-dermoscopic appearance")
     return warnings, focus
+
+
+def probability_map_with_colorbar(probability: np.ndarray) -> np.ndarray:
+    """Render a Turbo probability map with an embedded 0–1 colour bar."""
+    values = np.uint8(np.clip(probability, 0, 1) * 255)
+    colored = cv2.cvtColor(cv2.applyColorMap(values, cv2.COLORMAP_TURBO), cv2.COLOR_BGR2RGB)
+    bar_width = max(34, colored.shape[1] // 10)
+    gradient = np.linspace(255, 0, colored.shape[0], dtype=np.uint8)[:, None]
+    bar = cv2.cvtColor(cv2.applyColorMap(np.repeat(gradient, bar_width, axis=1), cv2.COLORMAP_TURBO), cv2.COLOR_BGR2RGB)
+    labelled = np.full((colored.shape[0], bar_width + 42, 3), 255, dtype=np.uint8)
+    labelled[:, :bar_width] = bar
+    for value, y in ((1.0, 14), (0.5, colored.shape[0] // 2), (0.0, colored.shape[0] - 7)):
+        cv2.putText(labelled, f"{value:.1f}", (bar_width + 3, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (25, 33, 31), 1, cv2.LINE_AA)
+    return np.concatenate([colored, labelled], axis=1)
+
+
+def zoom_to_mask(image: np.ndarray, mask: np.ndarray, zoom: float) -> np.ndarray:
+    if zoom <= 1.01 or not np.any(mask):
+        return image
+    height, width = image.shape[:2]
+    ys, xs = np.where(mask > 0)
+    center_x, center_y = int(xs.mean()), int(ys.mean())
+    crop_w, crop_h = max(1, int(width / zoom)), max(1, int(height / zoom))
+    x0 = min(max(0, center_x - crop_w // 2), width - crop_w)
+    y0 = min(max(0, center_y - crop_h // 2), height - crop_h)
+    return image[y0:y0 + crop_h, x0:x0 + crop_w]
+
+
+def array_to_png_bytes(image_rgb: np.ndarray) -> bytes:
+    buffer = BytesIO()
+    Image.fromarray(np.uint8(np.clip(image_rgb, 0, 255))).save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 def visual_descriptors(crop_rgb: np.ndarray, mask: np.ndarray) -> dict[str, float]:
@@ -391,35 +496,37 @@ def build_pdf_report(
     segmented_overlay: np.ndarray,
     predicted_code: str,
     classification_confidence: float,
-    mask_certainty: float,
+    mean_foreground_probability: float,
     coverage: float,
     location_text: str,
     warnings: list[str],
+    report_id: str,
+    prediction_uncertainty: float,
 ) -> bytes:
     """Create an in-memory, two-image patient-friendly research report."""
     output = BytesIO()
     guide = DISEASE_GUIDE[predicted_code]
     doc = SimpleDocTemplate(
         output, pagesize=A4, rightMargin=42, leftMargin=42,
-        topMargin=38, bottomMargin=58, title="Cutivanta Lens Analysis",
+        topMargin=30, bottomMargin=52, title=f"{BRAND_NAME} Research Report",
     )
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle(
         "PrismTitle", parent=styles["Title"], fontName="Helvetica-Bold",
-        fontSize=23, leading=28, textColor=colors.HexColor("#087F72"),
-        alignment=TA_CENTER, spaceAfter=5,
+        fontSize=19, leading=23, textColor=colors.HexColor("#087F72"),
+        alignment=TA_CENTER, spaceAfter=4,
     )
     subtitle_style = ParagraphStyle(
         "PrismSub", parent=styles["Normal"], fontSize=9.5, leading=14,
-        textColor=colors.HexColor("#64716E"), alignment=TA_CENTER, spaceAfter=18,
+        textColor=colors.HexColor("#64716E"), alignment=TA_CENTER, spaceAfter=8,
     )
     heading_style = ParagraphStyle(
         "PrismHeading", parent=styles["Heading2"], fontName="Helvetica-Bold",
-        fontSize=13, leading=17, textColor=colors.HexColor("#17211F"), spaceBefore=10, spaceAfter=7,
+        fontSize=12, leading=15, textColor=colors.HexColor("#17211F"), spaceBefore=8, spaceAfter=5,
     )
     body_style = ParagraphStyle(
         "PrismBody", parent=styles["BodyText"], fontSize=9.5, leading=14,
-        textColor=colors.HexColor("#34413E"), spaceAfter=8,
+        textColor=colors.HexColor("#34413E"), spaceAfter=6,
     )
     caution_style = ParagraphStyle(
         "PrismCaution", parent=body_style, fontName="Helvetica-Bold", fontSize=9,
@@ -431,16 +538,35 @@ def build_pdf_report(
         canvas.setStrokeColor(colors.HexColor("#D7E4E0"))
         canvas.line(42, 43, A4[0] - 42, 43)
         canvas.setFillColor(colors.HexColor("#7B4A15"))
-        canvas.setFont("Helvetica-Bold", 7.7)
-        footer_text = "CAUTION: Research-oriented AI output only - not a diagnosis or treatment prescription. A qualified doctor must evaluate the lesion."
-        canvas.drawCentredString(A4[0] / 2, 28, footer_text)
+        canvas.setFont("Helvetica-Bold", 7.2)
+        canvas.drawCentredString(A4[0] / 2, 29, "RESEARCH USE ONLY - professional confirmation is required")
+        canvas.setFont("Helvetica", 6.8)
+        canvas.drawCentredString(A4[0] / 2, 18, "© 2026 Siba Sundar Das. All rights reserved.")
         canvas.restoreState()
 
-    original = PDFImage(array_to_jpeg_buffer(image_rgb), width=3.25 * inch, height=2.43 * inch, kind="proportional")
-    segmented = PDFImage(array_to_jpeg_buffer(segmented_overlay), width=3.25 * inch, height=2.43 * inch, kind="proportional")
+    generated_at = datetime.now().astimezone().strftime("%d %b %Y, %I:%M:%S %p %Z")
+    metadata_table = Table([
+        ["Report ID", report_id, "Generated date and time", generated_at],
+        ["Model version", MODEL_VERSION, "Application version", APPLICATION_VERSION],
+        ["Use label", "RESEARCH USE ONLY", "", ""],
+    ], colWidths=[0.9 * inch, 2.55 * inch, 1.15 * inch, 2.15 * inch])
+    metadata_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F3F8F6")),
+        ("TEXTCOLOR", (0, 0), (-1, -1), colors.HexColor("#34413E")),
+        ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTNAME", (2, 0), (2, -1), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+        ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#D7E4E0")),
+        ("SPAN", (1, 2), (3, 2)),
+        ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+
+    original = PDFImage(array_to_jpeg_buffer(image_rgb), width=2.9 * inch, height=2.0 * inch, kind="proportional")
+    segmented = PDFImage(array_to_jpeg_buffer(segmented_overlay), width=2.9 * inch, height=2.0 * inch, kind="proportional")
     image_table = Table(
-        [[original, segmented], [Paragraph("<b>Uploaded image</b>", subtitle_style), Paragraph("<b>Detected lesion overlay</b>", subtitle_style)]],
-        colWidths=[3.45 * inch, 3.45 * inch], hAlign="CENTER",
+        [[original, segmented], [Paragraph("<b>Original image</b>", subtitle_style), Paragraph("<b>Model-predicted lesion boundary</b>", subtitle_style)]],
+        colWidths=[3.3 * inch, 3.3 * inch], hAlign="CENTER",
     )
     image_table.setStyle(TableStyle([
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
@@ -452,10 +578,11 @@ def build_pdf_report(
     ]))
 
     result_table = Table([
-        ["Model category", CLASS_NAMES[predicted_code]],
-        ["Classification probability", f"{classification_confidence:.1%}"],
-        ["Mask certainty proxy", f"{mask_certainty:.1%}"],
-        ["Image area localized", f"{coverage:.1%}"],
+        ["Model-predicted category", CLASS_NAMES[predicted_code]],
+        ["Calibrated score", f"{classification_confidence:.1%}"],
+        ["Image area covered by predicted mask", f"{coverage:.1%}"],
+        ["Mean foreground mask probability", f"{mean_foreground_probability:.1%}"],
+        ["Prediction uncertainty", f"{prediction_uncertainty:.1%}"],
     ], colWidths=[2.0 * inch, 4.75 * inch])
     result_table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#E8F6F2")),
@@ -465,18 +592,20 @@ def build_pdf_report(
         ("FONTSIZE", (0, 0), (-1, -1), 9),
         ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#CFE0DB")),
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("TOPPADDING", (0, 0), (-1, -1), 7), ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+        ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
     ]))
 
     quality_text = "No basic image-quality warnings were triggered." if not warnings else "Quality notes: " + "; ".join(warnings) + "."
     story = [
-        Paragraph("Cutivanta Lens", title_style),
-        Paragraph("AI-assisted skin lesion visualization report", subtitle_style),
+        Paragraph(f"{BRAND_NAME} — AI-Assisted Skin Lesion Research Report", title_style),
+        Paragraph("Research-use-only output requiring professional confirmation", subtitle_style),
+        metadata_table,
+        Spacer(1, 6),
         image_table,
-        Spacer(1, 10),
+        Spacer(1, 5),
         Paragraph("Analysis summary", heading_style),
         result_table,
-        Spacer(1, 7),
+        Spacer(1, 4),
         Paragraph("Where the model found the lesion", heading_style),
         Paragraph(
             f"The segmentation model localized a connected region <b>{location_text}</b>, covering approximately <b>{coverage:.1%}</b> of the image. The colored overlay marks this model-selected region; it does not establish the true clinical boundary.",
@@ -498,14 +627,19 @@ def build_pdf_report(
         ),
         Paragraph(f"<b>Research source:</b> {guide['source']}<br/><font size='7'>{guide['url']}</font>", body_style),
         Paragraph(quality_text, body_style),
-        Spacer(1, 10),
+        Spacer(1, 5),
         Paragraph(
-            "This report is research-oriented and is not doctor-prescribed advice. Do not begin, stop, or change treatment based on this result; consult a qualified dermatologist.",
+            RESEARCH_CAUTION,
             caution_style,
         ),
     ]
     doc.build(story, onFirstPage=footer, onLaterPages=footer)
     return output.getvalue()
+
+
+def render_ui_footer() -> None:
+    st.markdown(f'<div class="disclaimer"><b>Caution:</b> {RESEARCH_CAUTION}</div>', unsafe_allow_html=True)
+    st.markdown('<div class="copyright">© 2026 Siba Sundar Das. All rights reserved.</div>', unsafe_allow_html=True)
 
 
 def main() -> None:
@@ -514,7 +648,7 @@ def main() -> None:
     st.markdown(
         f"""
         <section class="hero">
-          <div class="brand"><img class="brand-logo" src="data:image/png;base64,{logo_data}" alt="Cutivanta Lens logo">Cutivanta Lens</div>
+          <div class="brand"><img class="brand-logo" src="data:image/png;base64,{logo_data}" alt="{BRAND_NAME} logo">{BRAND_NAME}</div>
           <h1>Look closer. Understand better.</h1>
           <p>A focused visual workspace for lesion localization, model evidence, image measurements, and carefully sourced condition information.</p>
         </section>
@@ -531,7 +665,7 @@ def main() -> None:
             label_visibility="collapsed",
         )
         analyze = st.button("Upload & analyze image", type="primary", disabled=uploaded is None)
-    st.markdown('<div class="disclaimer"><b>Research-use notice:</b> Cutivanta Lens provides an AI-generated educational result, not a medical diagnosis or doctor-prescribed treatment; professional dermatologist review is required.</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="disclaimer"><b>Research-use-only:</b> {BRAND_NAME} provides an AI-generated educational result, not a medical diagnosis; professional dermatologist review is required.</div>', unsafe_allow_html=True)
 
     if uploaded is None:
         st.session_state.pop("cutivanta_analysis", None)
@@ -540,21 +674,23 @@ def main() -> None:
         a.info("**One lesion**\n\nKeep the lesion centered and fully visible.")
         b.info("**Even light**\n\nAvoid glare, shadows, rulers, or pen markings.")
         c.info("**Sharp image**\n\nUse a close, focused photo with natural skin color.")
+        render_ui_footer()
         return
     upload_key = hashlib.sha256(uploaded.getvalue()).hexdigest()
     cached_result = st.session_state.get("cutivanta_analysis")
     if not analyze and (not cached_result or cached_result.get("upload_key") != upload_key):
         st.info("Your image is ready. Select **Upload & analyze image** to begin.")
+        render_ui_footer()
         return
 
     if analyze:
         try:
-            image_rgb = read_image(uploaded)
+            image_rgb, image_metadata = read_image(uploaded)
             upload_fingerprint = upload_key[:10]
-            with st.spinner("Cutivanta Lens is examining the image..."):
+            with st.spinner(f"{BRAND_NAME} is examining the image..."):
                 seg_model, cls_model = load_models()
                 segmentation = segment_lesion(seg_model, image_rgb)
-                warnings, focus = quality_checks(image_rgb, segmentation["coverage"])
+                warnings, focus = quality_checks(image_rgb, segmentation, image_metadata)
                 crop_rgb, box = padded_masked_crop(image_rgb, segmentation["mask"])
                 probabilities, cls_tensor = classify(cls_model, crop_rgb)
                 predicted_index = int(np.argmax(probabilities))
@@ -571,6 +707,7 @@ def main() -> None:
                 "upload_key": upload_key,
                 "upload_fingerprint": upload_fingerprint,
                 "image_rgb": image_rgb,
+                "image_metadata": image_metadata,
                 "segmentation": segmentation,
                 "warnings": warnings,
                 "focus": focus,
@@ -591,11 +728,13 @@ def main() -> None:
             st.error("The analysis could not be completed.")
             st.exception(exc)
             st.caption("Check that both model files remain beside app.py and that TensorFlow/Keras versions match requirements.txt.")
+            render_ui_footer()
             return
     else:
         result = cached_result
         upload_fingerprint = result["upload_fingerprint"]
         image_rgb = result["image_rgb"]
+        image_metadata = result.get("image_metadata", {"original_mode": "RGB", "aspect_ratio": image_rgb.shape[1] / image_rgb.shape[0]})
         segmentation = result["segmentation"]
         warnings = result["warnings"]
         focus = result["focus"]
@@ -624,23 +763,23 @@ def main() -> None:
         st.markdown('<div class="panel-label">Original image</div>', unsafe_allow_html=True)
         st.image(image_rgb, use_container_width=True)
     with segment_col:
-        st.markdown('<div class="panel-label">Detected lesion</div>', unsafe_allow_html=True)
+        st.markdown('<div class="panel-label">Model-predicted lesion boundary</div>', unsafe_allow_html=True)
         st.image(segmented_view, use_container_width=True)
         st.caption(f"Localized {location_text}.")
     with result_col:
-        st.markdown('<div class="panel-label">Model result</div>', unsafe_allow_html=True)
+        st.markdown('<div class="panel-label">Model-predicted category</div>', unsafe_allow_html=True)
         st.markdown(
-            f'<div class="result-card"><span class="result-code">{predicted_code}</span><div class="result-name">{CLASS_NAMES[predicted_code]}</div><div class="soft-note">Highest model probability: <b>{prediction_confidence:.1%}</b><br>Separation from second choice: <b>{margin:.1%}</b></div></div>',
+            f'<div class="result-card"><div class="panel-label">Model-predicted category</div><div class="result-name">{CLASS_NAMES[predicted_code]}</div><div class="soft-note">Calibrated score: <b>{prediction_confidence:.1%}</b><br>This research output requires professional confirmation.</div></div>',
             unsafe_allow_html=True,
         )
         st.progress(prediction_confidence)
         st.caption("Model probability is not diagnostic certainty.")
 
     metric1, metric2, metric3, metric4 = st.columns(4)
-    metric1.metric("Segmentation certainty", f"{segmentation['certainty']:.1%}", help="A pixel-certainty proxy, not clinical confidence.")
-    metric2.metric("Localized area", f"{segmentation['coverage']:.1%}")
-    metric3.metric("Class probability", f"{prediction_confidence:.1%}")
-    metric4.metric("Prediction clarity", f"{(1.0 - entropy):.1%}")
+    metric1.metric("Image area covered by predicted mask", f"{segmentation['coverage']:.1%}")
+    metric2.metric("Mean foreground mask probability", f"{segmentation['foreground_probability']:.1%}", help="Mean model probability within the retained mask; not clinical confidence.")
+    metric3.metric("Top predicted-class score", f"{prediction_confidence:.1%}")
+    metric4.metric("Prediction uncertainty", f"{entropy:.1%}", help="Normalized entropy across the seven model classes; higher means less decisive.")
 
     st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
     st.markdown("## Model insight")
@@ -651,17 +790,11 @@ def main() -> None:
     hot = heat >= np.quantile(heat, 0.70)
     attention_overlap = float(hot[crop_mask.astype(bool)].sum() / max(hot.sum(), 1))
     descriptors = visual_descriptors(crop_rgb, crop_mask)
-    insight_choice = st.selectbox(
-        "Choose an insight view",
-        [
-            "Grad-CAM attention",
-            "Segmentation probability and boundary",
-            "Shape and border profile",
-            "Colour and texture profile",
-        ],
-    )
+    gradcam_tab, segmentation_tab, shape_tab, colour_tab = st.tabs([
+        "Grad-CAM", "Segmentation", "Shape", "Colour",
+    ])
 
-    if insight_choice == "Grad-CAM attention":
+    with gradcam_tab:
         left, right = st.columns([1.08, 1], gap="large")
         with left:
             st.image(gradcam_view, use_container_width=True)
@@ -675,27 +808,67 @@ def main() -> None:
             )
             st.caption("Grad-CAM explains model attention, not biological malignancy.")
 
-    elif insight_choice == "Segmentation probability and boundary":
+    with segmentation_tab:
+        st.markdown("### Segmentation visualisation")
+        controls = st.columns(4)
+        with controls[0]:
+            overlay_opacity = st.slider("Overlay opacity", 0.0, 1.0, 0.48, 0.05)
+        with controls[1]:
+            boundary_thickness = st.slider("Boundary thickness", 1, 8, 3)
+        with controls[2]:
+            zoom_level = st.slider("Zoom", 1.0, 3.0, 1.0, 0.25)
+        with controls[3]:
+            side_by_side = st.toggle("Side-by-side comparison", value=True)
+        interactive_overlay = mask_overlay(
+            image_rgb, segmentation["mask"], overlay_opacity, boundary_thickness,
+        )
+        probability_view = probability_map_with_colorbar(segmentation["probability"])
+        zoomed_original = zoom_to_mask(image_rgb, segmentation["mask"], zoom_level)
+        zoomed_overlay = zoom_to_mask(interactive_overlay, segmentation["mask"], zoom_level)
+        st.caption(
+            f"Mask threshold: **{MASK_THRESHOLD:.2f}** · Overlay opacity: **{overlay_opacity:.0%}** · "
+            f"Boundary: **{boundary_thickness}px white inner contour with dark outer contour**"
+        )
         left, middle, right = st.columns(3, gap="large")
         with left:
             st.markdown("### Probability map")
-            st.image(segmentation["probability"], clamp=True, use_container_width=True)
-            st.caption("Brighter pixels received higher lesion probability.")
+            st.image(probability_view, use_container_width=True)
+            st.caption("The colour bar maps pixel-level lesion probability from 0.0 to 1.0.")
         with middle:
-            st.markdown("### Final binary mask")
+            st.markdown("### Binary mask")
             st.image(segmentation["mask"] * 255, clamp=True, use_container_width=True)
             st.caption(f"Threshold {MASK_THRESHOLD:.2f}; the largest connected region was retained.")
         with right:
             st.markdown("### Boundary overlay")
-            st.image(segmented_view, use_container_width=True)
-            st.metric("Pixel certainty proxy", f"{segmentation['certainty']:.1%}")
+            st.image(zoomed_overlay, use_container_width=True)
+            st.metric("Mean foreground probability", f"{segmentation['foreground_probability']:.1%}")
+        if side_by_side:
+            st.markdown("#### Original and overlay comparison")
+            comparison_left, comparison_right = st.columns(2, gap="small")
+            comparison_left.image(zoomed_original, caption="Original image", use_container_width=True)
+            comparison_right.image(zoomed_overlay, caption="Model-predicted lesion boundary", use_container_width=True)
+        download_mask, download_overlay = st.columns(2)
+        download_mask.download_button(
+            "Download mask",
+            data=array_to_png_bytes(segmentation["mask"] * 255),
+            file_name=f"{upload_fingerprint}_predicted_mask.png",
+            mime="image/png",
+            on_click="ignore",
+        )
+        download_overlay.download_button(
+            "Download overlay",
+            data=array_to_png_bytes(interactive_overlay),
+            file_name=f"{upload_fingerprint}_boundary_overlay.png",
+            mime="image/png",
+            on_click="ignore",
+        )
 
-    elif insight_choice == "Shape and border profile":
+    with shape_tab:
         left, right = st.columns([1.05, 1], gap="large")
         extent = mask_extent(segmentation["mask"])
         with left:
             st.image(segmented_view, use_container_width=True)
-            st.caption("The pale contour is the model-selected boundary.")
+            st.caption("The dark outer and white inner contours show the model-selected boundary.")
         with right:
             st.markdown("### Geometry summary")
             st.metric("Mask coverage", f"{segmentation['coverage']:.1%}")
@@ -711,7 +884,7 @@ def main() -> None:
                 st.markdown(f'<div class="descriptor"><b>{label}</b><span style="float:right">{value:.0%}</span><div class="descriptor-line"><div class="descriptor-fill" style="width:{value * 100:.1f}%"></div></div></div>', unsafe_allow_html=True)
             st.caption("These are image descriptors, not clinical ABCDE scores.")
 
-    else:
+    with colour_tab:
         left, right = st.columns([1.05, 1], gap="large")
         palette, colour_fractions = color_palette(crop_rgb, crop_mask)
         lesion_pixels = crop_rgb[crop_mask.astype(bool)]
@@ -766,16 +939,19 @@ def main() -> None:
 
     st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
     st.markdown("## Your report")
+    report_id = f"CVL-{datetime.now().astimezone():%Y%m%d}-{upload_fingerprint.upper()}"
     with st.spinner("Preparing your illustrated PDF report..."):
         pdf_report = build_pdf_report(
             image_rgb=image_rgb,
             segmented_overlay=segmented_view,
             predicted_code=predicted_code,
             classification_confidence=prediction_confidence,
-            mask_certainty=float(segmentation["certainty"]),
+            mean_foreground_probability=float(segmentation["foreground_probability"]),
             coverage=float(segmentation["coverage"]),
             location_text=location_text,
             warnings=warnings,
+            report_id=report_id,
+            prediction_uncertainty=entropy,
         )
     st.download_button(
         "Download illustrated PDF report",
@@ -784,7 +960,7 @@ def main() -> None:
         mime="application/pdf",
         on_click="ignore",
     )
-    st.markdown('<div class="disclaimer"><b>Caution:</b> This is a research-oriented AI report, not doctor-prescribed advice. Do not self-treat from this result; a qualified dermatologist must examine and confirm the lesion.</div>', unsafe_allow_html=True)
+    render_ui_footer()
 
 
 if __name__ == "__main__":

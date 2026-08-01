@@ -1,4 +1,4 @@
-# Cutivanta Lens deployment
+# CutiVanta Lens deployment
 
 This Streamlit app provides the complete project analysis:
 

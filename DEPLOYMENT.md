@@ -1,4 +1,4 @@
-# Push and deploy Cutivanta Lens
+# Push and deploy CutiVanta Lens
 
 The app uses two large model files. GitHub's normal repository limit is not
 suitable for the 635 MB `.keras` model, so install and use Git LFS first.
@@ -36,7 +36,7 @@ git add .gitattributes .gitignore
 git add app.py requirements.txt README.md DEPLOYMENT.md .streamlit/config.toml
 git add unet_efficientnetv2s_final.keras densenet201_best.h5
 git status
-git commit -m "Deploy Cutivanta Lens Streamlit app"
+git commit -m "Deploy CutiVanta Lens Streamlit app"
 git remote add origin https://github.com/YOUR_USERNAME/cutivanta-lens.git
 git push -u origin main
 ```
